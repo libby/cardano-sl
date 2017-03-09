@@ -124,8 +124,13 @@ mkCTx addr diff THEntry {..} meta = CTx {..}
     ctId = txIdToCTxId _thTxId
     outputs = toList $ _txOutputs _thTx
     isToItself = all ((== addr) . txOutAddress) outputs
+    outputsFilter = if isToItself
+        then const False
+        else if _thIsOutput
+                 then (/= addr)
+                 else (== addr)
     ctAmount = unsafeIntegerToCoin . sumCoins . map txOutValue $
-        filter ((|| isToItself) . xor _thIsOutput . (== addr) . txOutAddress) outputs
+        filter (outputsFilter . txOutAddress) outputs
     ctConfirmations = maybe 0 fromIntegral $ (diff -) <$> _thDifficulty
     ctType = if _thIsOutput
              then CTOut meta
