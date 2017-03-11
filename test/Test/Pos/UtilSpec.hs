@@ -31,10 +31,12 @@ spec = describe "Util" $ do
         prop description_verifyDiffMapIsSmaller verifyDiffMapIsSmaller
     describe "IsList" $ do
         describe "toList . fromList = id" $ do
-            prop description_toFromListNew (toFromList @[] @NewestFirst)
-            prop description_toFromListNew (toFromList @NE.NonEmpty @NewestFirst)
-            prop description_toFromListOld (toFromList @[] @OldestFirst)
-            prop description_toFromListOld (toFromList @NE.NonEmpty @OldestFirst)
+            prop (description_toFromListNew "[]") (toFromList @[] @NewestFirst)
+            prop (description_toFromListNew "NonEmpty")
+                (toFromList @NE.NonEmpty @NewestFirst)
+            prop (description_toFromListOld "[]") (toFromList @[] @OldestFirst)
+            prop (description_toFromListOld "NonEmpty")
+                (toFromList @NE.NonEmpty @OldestFirst)
     describe "Chrono" $ do
         prop (description_fromOldestToNewest "[]") (fromOldestToNewest @[])
         prop (description_fromOldestToNewest "NonEmpty") (fromOldestToNewest @NE.NonEmpty)
@@ -59,10 +61,12 @@ spec = describe "Util" $ do
         \ corresponding to these keys have a non-empty intersection, the difference\
         \ map's inner maps corresponding to those keys will be smaller in size than the\
         \ inner maps in the minuend hashmap"
-    description_toFromListNew =
-        "Converting 'NewestFirst [] a' to '[Item a]' and back changes nothing"
-    description_toFromListOld =
-        "Converting 'OldestFirst [] a' to '[Item a]' and back changes nothing"
+    description_toFromListNew functor =
+        "Converting 'NewestFirst " ++ functor ++ " a' to '[Item a]' and back changes\
+        \ nothing"
+    description_toFromListOld functor =
+        "Converting 'OldestFirst " ++ functor ++ " a' to '[Item a]' and back changes\
+        \ nothing"
     description_fromOldestToNewest functor =
         "Converting 'NewestFirst " ++ functor ++ " a' to 'OldestFirst " ++ functor ++
         " a' and back again changes nothing"
