@@ -9,6 +9,7 @@
 module Pos.Wallet.WalletMode
        ( MonadBalances (..)
        , MonadTxHistory (..)
+       , TxHistoryAnswer (..)
        , MonadBlockchainInfo (..)
        , MonadUpdates (..)
        , TxMode
@@ -16,7 +17,6 @@ module Pos.Wallet.WalletMode
        , WalletRealMode
        ) where
 
-import           Control.Concurrent.MVar     (takeMVar)
 import           Control.Concurrent.STM      (TMVar, tryReadTMVar)
 import           Control.Monad.Loops         (unfoldrM)
 import           Control.Monad.Trans         (MonadTrans)
@@ -54,7 +54,7 @@ import           Pos.Txp                     (TxAux, TxId, TxpHolder (..), Utxo,
                                               txOutValue, txProcessTransaction,
                                               _mpLocalTxs)
 import           Pos.Types                   (Address, BlockHeader, ChainDifficulty, Coin,
-                                              difficultyL, flattenEpochOrSlot,
+                                              HeaderHash, difficultyL, flattenEpochOrSlot,
                                               flattenSlotId, prevBlockL, prevBlockL,
                                               sumCoins, sumCoins)
 import           Pos.Update                  (ConfirmedProposalState (..), USHolder (..))
@@ -109,14 +109,24 @@ instance (MonadDB m, MonadMask m) => MonadBalances (TxpHolder m) where
             utxo' = foldr M.delete utxo toDel
         return $ HM.foldrWithKey M.insert utxo' toAdd
 
+data TxHistoryAnswer = TxHistoryAnswer
+    { taLastCachedHash :: HeaderHash
+    , taCachedNum      :: Int
+    , taCachedUtxo     :: Utxo
+    , taHistory        :: [TxHistoryEntry]
+    } deriving (Show)
+
 -- | A class which have methods to get transaction history
 class Monad m => MonadTxHistory m where
-    getTxHistory :: SscHelpersClass ssc
-                 => Tagged ssc (Address -> m [TxHistoryEntry])
+    getTxHistory
+        :: SscHelpersClass ssc
+        => Tagged ssc (Address -> Maybe (HeaderHash, Utxo) -> m TxHistoryAnswer)
     saveTx :: (TxId, TxAux) -> m ()
 
-    default getTxHistory :: (SscHelpersClass ssc, MonadTrans t, MonadTxHistory m', t m' ~ m) => Tagged ssc (Address -> m [TxHistoryEntry])
-    getTxHistory = fmap lift <$> getTxHistory
+    default getTxHistory
+        :: (SscHelpersClass ssc, MonadTrans t, MonadTxHistory m', t m' ~ m)
+        => Tagged ssc (Address -> Maybe (HeaderHash, Utxo) -> m TxHistoryAnswer)
+    getTxHistory = fmap (fmap lift) <$> getTxHistory
 
     default saveTx :: (MonadTrans t, MonadTxHistory m', t m' ~ m) => (TxId, TxAux) -> m ()
     saveTx = lift . saveTx
@@ -139,22 +149,24 @@ deriving instance MonadTxHistory m => MonadTxHistory (WalletWebDB m)
 
 -- | Get tx history for Address
 instance MonadIO m => MonadTxHistory (WalletDB m) where
-    getTxHistory = Tagged $ \addr -> do
+    getTxHistory = Tagged $ \addr _ -> do
         chain <- WS.getBestChain
         utxo <- WS.getOldestUtxo
-        fmap (fst . fromMaybe (panic "deriveAddrHistory: Nothing")) $
+        _ <- fmap (fst . fromMaybe (error "deriveAddrHistory: Nothing")) $
             runMaybeT $ flip runUtxoStateT utxo $
             deriveAddrHistory addr chain
+        pure $ error "getTxHistory is not implemented for light wallet"
     saveTx _ = pure ()
 
-instance (MonadDB m, MonadThrow m, WithLogger m)
-         => MonadTxHistory (TxpHolder m) where
+instance (MonadDB m, MonadThrow m, WithLogger m, PC.WithNodeContext s m) =>
+         MonadTxHistory (TxpHolder m) where
     getTxHistory :: forall ssc. SscHelpersClass ssc
-                 => Tagged ssc (Address -> TxpHolder m [TxHistoryEntry])
-    getTxHistory = Tagged $ \addr -> do
-        bot <- GS.getBot
+                 => Tagged ssc (Address -> Maybe (HeaderHash, Utxo) -> TxpHolder m TxHistoryAnswer)
+    getTxHistory = Tagged $ \addr mInit -> do
         tip <- GS.getTip
-        genUtxo <- GS.getFilteredGenUtxo addr
+
+        let getGenUtxo = filterUtxoByAddr addr . PC.ncGenesisUtxo <$> PC.getNodeContext
+        (bot, genUtxo) <- maybe ((,) <$> GS.getBot <*> getGenUtxo) pure mInit
 
         -- Getting list of all hashes in main blockchain (excluding bottom block - it's genesis anyway)
         hashList <- flip unfoldrM tip $ \h ->
@@ -166,6 +178,10 @@ instance (MonadDB m, MonadThrow m, WithLogger m)
                 let prev = header ^. prevBlockL
                 return $ Just (h, prev)
 
+        -- Determine last block which txs should be cached
+        let cachedHashes = drop blkSecurityParam hashList
+            nonCachedHashes = take blkSecurityParam hashList
+
         let blockFetcher h txs = do
                 blk <- lift . lift $ DB.getBlock @ssc h >>=
                        maybeThrow (DBMalformed "A block mysteriously disappeared!")
@@ -176,9 +192,18 @@ instance (MonadDB m, MonadThrow m, WithLogger m)
                 txs <- getRelatedTxs addr $ map mp ltxs
                 return $ txs ++ blkTxs
 
-        result <- runMaybeT $
-            evalUtxoStateT (foldrM blockFetcher [] hashList >>= localFetcher) genUtxo
-        maybe (panic "deriveAddrHistory: Nothing") return result
+        mres <- runMaybeT $ do
+            (cachedTxs, cachedUtxo) <- runUtxoStateT
+                (foldrM blockFetcher [] cachedHashes) genUtxo
+
+            result <- evalUtxoStateT
+                (foldrM blockFetcher cachedTxs nonCachedHashes >>= localFetcher)
+                cachedUtxo
+
+            let lastCachedHash = maybe bot identity $ head cachedHashes
+            return $ TxHistoryAnswer lastCachedHash (length cachedTxs) cachedUtxo result
+
+        maybe (error "deriveAddrHistory: Nothing") pure mres
 
     saveTx txw = () <$ runExceptT (txProcessTransaction txw)
 
@@ -213,15 +238,23 @@ deriving instance MonadBlockchainInfo m => MonadBlockchainInfo (WalletWebDB m)
 
 -- | Stub instance for lite-wallet
 instance MonadBlockchainInfo WalletRealMode where
-    networkChainDifficulty = panic "notImplemented"
-    localChainDifficulty = panic "notImplemented"
-    blockchainSlotDuration = panic "notImplemented"
-    connectedPeers = panic "notImplemented"
+    networkChainDifficulty = error "notImplemented"
+    localChainDifficulty = error "notImplemented"
+    blockchainSlotDuration = error "notImplemented"
+    connectedPeers = error "notImplemented"
 
 -- | Helpers for avoiding copy-paste
 topHeader :: (SscHelpersClass ssc, MonadDB m) => m (BlockHeader ssc)
 topHeader = maybeThrow (DBMalformed "No block with tip hash!") =<<
             DB.getBlockHeader =<< GS.getTip
+
+getContextTVar
+    :: (Ssc ssc, MonadIO m, PC.WithNodeContext ssc m)
+    => (PC.NodeContext ssc -> TVar a)
+    -> m a
+getContextTVar getter =
+    PC.getNodeContext >>=
+    atomically . readTVar . getter
 
 getContextTMVar
     :: (Ssc ssc, MonadIO m, PC.WithNodeContext ssc m)
@@ -231,11 +264,6 @@ getContextTMVar getter =
     PC.getNodeContext >>=
     atomically . tryReadTMVar . getter
 
-recoveryHeader
-    :: (Ssc ssc, MonadIO m, PC.WithNodeContext ssc m)
-    => m (Maybe (BlockHeader ssc))
-recoveryHeader = fmap snd <$> getContextTMVar PC.ncRecoveryHeader
-
 downloadHeader
     :: (Ssc ssc, MonadIO m, PC.WithNodeContext ssc m)
     => m (Maybe (BlockHeader ssc))
@@ -244,8 +272,11 @@ downloadHeader = getContextTMVar PC.ncProgressHeader
 -- | Instance for full-node's ContextHolder
 instance forall ssc . SscHelpersClass ssc =>
          MonadBlockchainInfo (RawRealMode ssc) where
-    networkChainDifficulty = recoveryHeader >>= \case
-        Just rh -> return . Just $ rh ^. difficultyL
+    networkChainDifficulty = getContextTVar PC.ncLastKnownHeader >>= \case
+        Just lh -> do
+            thDiff <- view difficultyL <$> topHeader @ssc
+            let lhDiff = lh ^. difficultyL
+            return . Just $ max thDiff lhDiff
         Nothing -> runMaybeT $ do
             cSlot <- flattenSlotId <$> MaybeT getCurrentSlot
             th <- lift (topHeader @ssc)
@@ -290,7 +321,7 @@ deriving instance MonadUpdates m => MonadUpdates (WalletWebDB m)
 
 -- | Dummy instance for lite-wallet
 instance MonadIO m => MonadUpdates (WalletDB m) where
-    waitForUpdate = panic "notImplemented"
+    waitForUpdate = error "notImplemented"
     applyLastUpdate = pure ()
 
 -- | Instance for full node
